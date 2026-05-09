@@ -1,0 +1,34 @@
+# ROMs - never commit copyrighted game data
+*.gba
+*.zip
+*.sav
+
+# Build artifacts
+build/
+*.exe
+*.pdb
+*.obj
+*.dll
+*.lib
+*.exp
+*.ilk
+
+# Generated source (regenerate with gbarecomp)
+recomp_out/
+
+# Logs
+*.log
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude
+.claude/
