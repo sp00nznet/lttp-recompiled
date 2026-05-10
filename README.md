@@ -14,8 +14,8 @@ Driving the development of [gbarecomp](https://github.com/sp00nznet/gbarecomp) -
 | Stub generation | Done - 7,331 stubs + 833 trap stubs for unresolved targets |
 | Native compile | **Done** - 20.8 MB AZLE.exe (MSVC /O1, MP, ~30 min) |
 | Runtime init | **Done** - SDL2 window, flat memory, BIOS HLE all online |
-| Boot frames | **Done** - 300+ frames render at 60 fps |
-| Game past forced blank | Not yet - DISPCNT stays at 0x0080 (forced blank) |
+| Boot frames | **Done** - 600+ frames render at 60 fps, IRQ handler runs cleanly |
+| Game past forced blank | Not yet - DISPCNT stays at 0x0080 (forced blank), same parity as Advance Wars |
 | Title screen | Not yet |
 | Gameplay | Not yet |
 
@@ -74,6 +74,9 @@ So: the runtime scheduler delivers a VBlank IRQ before the game has populated it
 [sp00nznet/gbarecomp@f4a9910](https://github.com/sp00nznet/gbarecomp/commit/f4a9910):
 3. **Runtime bails on ARM `BX Rm` to unmapped region** (i.e. not BIOS/EWRAM/IWRAM/ROM) instead of falling into a 2M-step walk through zero memory. Also added byte+register-state diagnostics on step-limit hits.
 
+[sp00nznet/gbarecomp@76c26af](https://github.com/sp00nznet/gbarecomp/commit/76c26af):
+4. **ARM interpreter handles `MSR`/`MRS` before data-processing.** Hunting the IRQ spin further with LDR/LDM/DataProc-pc instrumentation surfaced the real root cause: `MSR CPSR_cf, r3` (`0xE129F003`) was being decoded as `TEQ` (opcode 9) by the data-processing handler because MSR's encoding overlaps with TST/TEQ/CMP/CMN-without-S. Then with Rd=15 the data-processing path dropped the XOR result into pc, producing the garbage `0x047A13BC` we'd been chasing. Moving the MSR/MRS checks above data-processing fixed it; LttP now runs 600+ frames cleanly through its IRQ handler.
+
 ## What's done
 
 | Component | How |
@@ -88,9 +91,9 @@ So: the runtime scheduler delivers a VBlank IRQ before the game has populated it
 
 ## Open questions / next dives
 
-- The new ARM-BX-to-unmapped guard didn't catch anything, so the bad `pc=0x047A13BC` arrives via a non-BX path (`LDR pc, [...]`, `LDM ... ^` IRQ-return form, or `MSR` mishandled and clobbering pc). The interpreter has special cases for MSR/MRS but the data-processing handler runs *first* in the if-chain and may misclassify MSR (rd=15, S=0) as TEQ.
-- Even if we fix that path, the underlying issue is timing: the standalone runtime delivers VBlank/HBlank IRQs based on scanline ticks, but the game's startup writes to its IWRAM subhandler table at its own pace. Need to either (a) gate IRQ delivery on the game having written non-zero into the subhandler slot, or (b) install a "no-op handler if uninitialized" check inside the runtime.
-- Once IRQ dispatch works, `DISPCNT` should clear forced-blank during init and the title screen logo should appear.
+- IRQ handler now runs cleanly, but the game stays in forced-blank (DISPCNT=0x0080) for 600+ frames. Same symptom Advance Wars hits per the gbarecomp README — likely missing mid-function entries during init (recompiled functions exist but a BX-into-the-middle dispatches to an empty stub) or a missing/incorrect BIOS HLE call.
+- Reproducer: run AZLE.exe and stderr is silent — no spins, no warnings — yet DISPCNT never changes. Need a tracer that logs *which* recompiled functions get called per frame so we can see which init function the game stops at.
+- Once that's pinned down, fix it in gbarecomp's analyzer (mid-function entry detection in Phase 7) or runtime (BIOS HLE coverage).
 
 ## Numbers
 
