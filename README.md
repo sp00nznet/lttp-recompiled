@@ -30,7 +30,49 @@ $ ./AZLE.exe game.gba
 [interp] step limit hit at 0x030059B0 (2000000 steps)
 ```
 
-That last line is the next thing to fix. The game copied a routine into IWRAM at 0x030059B0 (game's crt0 does this for IRQ-handling code), and gbarecomp's runtime ARM/Thumb interpreter is spinning in it for 2M instructions before bailing out — almost certainly a wait-for-IRQ-flag loop that needs a tighter recognition path or an interrupt that isn't being delivered.
+That last line is the next thing to fix. The game copied a routine into IWRAM at 0x030059B0 (game's crt0 does this for IRQ-handling code), and gbarecomp's runtime ARM/Thumb interpreter is spinning in it for 2M instructions before bailing out.
+
+### Deeper dive on the IRQ spin
+
+After adding diagnostics that dump bytes + IE/IF/IME state on step-limit-hit, the picture is:
+
+```
+[interp] step limit hit at 0x030059B0 (2000000 steps), pc=0x047A13BC
+[interp]   bytes around target: 0000 0000 0000 0000 0000 0000 0000 0000 3301 E3A0 3C02 E283 2000 E593 10B8 E1D3
+[interp]   bytes around final pc: 0000 0000 0000 0000 0000 0000 0000 0000 ...
+[interp]   IE=0x2005 IF=0x0007 IME=1 DISPSTAT=0x0029 VCOUNT=205
+```
+
+Hex-searching the ROM for the first 16 bytes of the entry pinpoints the source: ROM `0x08000104` — the standard GBA IRQ handler stub the game's startup copies to IWRAM. Disassembling it:
+
+```
+MOV r3, #0x04000000        ; IE/IF/IME base
+ADD r3, r3, #0x200
+LDR r2, [r3, #0]           ; r2 = (IF<<16)|IE
+LDRH r1, [r3, #8]          ; r1 = IME
+MRS r0, SPSR
+STMDB sp!, {r0, r1, r2, r3, lr}
+MOV r0, #1; STRH r0, [r3, #8]   ; IME=1
+AND r1, r2, r2 LSR #16     ; pending = IE & IF
+... walk bits, find which IRQ fired (r12 = index*4)
+0x080001D4: LDR r1, [pc, #0x38]   ; r1 = subhandler-table-base = 0x03000B70
+0x080001D8: ADD r1, r1, r12       ; r1 = &handler[index]
+0x080001DC: LDR r0, [r1]          ; r0 = handler function pointer
+0x080001E0: STMDB sp!, {lr}
+0x080001E4: ADD lr, pc, #0
+0x080001E8: BX r0                 ; → bad pc 0x047A13BC
+```
+
+So: the runtime scheduler delivers a VBlank IRQ before the game has populated its subhandler table at IWRAM 0x03000B70. `BX r0` lands at uninitialized garbage, interpreter falls into walking zeros forever. This is a runtime-vs-game-init race that didn't bite Advance Wars because of timing differences.
+
+### Two upstream gbarecomp fixes from this session
+
+[sp00nznet/gbarecomp@5e8a680](https://github.com/sp00nznet/gbarecomp/commit/5e8a680):
+1. **Stub generator no longer skips non-ROM call targets.** LttP's translator emitted a `BL` to `0x07EC7956` (OAM region — clearly wrong, post-undefined-instruction garbage). The unresolved-stub pass had `if ((addr >> 24) != 0x08) continue` and silently skipped it, breaking the link with no recovery path. Now every referenced address gets a trap stub.
+2. **Generated CMakeLists uses /O1 + /MP and auto-copies runtime.c/display.c.** /O2 on the >2 MB generated translation units LttP produces (funcs_118.c is 2.5 MB) makes MSVC's regalloc burn 20+ minutes per file. /O1 with parallel cl.exe makes the build practical.
+
+[sp00nznet/gbarecomp@f4a9910](https://github.com/sp00nznet/gbarecomp/commit/f4a9910):
+3. **Runtime bails on ARM `BX Rm` to unmapped region** (i.e. not BIOS/EWRAM/IWRAM/ROM) instead of falling into a 2M-step walk through zero memory. Also added byte+register-state diagnostics on step-limit hits.
 
 ## What's done
 
@@ -44,12 +86,11 @@ That last line is the next thing to fix. The game copied a routine into IWRAM at
 | Native compile | MSVC + vcpkg SDL2 |
 | Save (SRAM) | runtime.c - .sav auto-load/save |
 
-## What gbarecomp got from this game so far
+## Open questions / next dives
 
-Two fixes already pushed upstream to [sp00nznet/gbarecomp@5e8a680](https://github.com/sp00nznet/gbarecomp/commit/5e8a680):
-
-1. **Stub generator no longer skips non-ROM call targets.** LttP's translator emitted a `BL` to `0x07EC7956` (OAM region — clearly wrong, post-undefined-instruction garbage). The stub generator's `if ((addr >> 24) != 0x08) continue` was hiding it from the unresolved-stubs pass, breaking the link with no recovery path. Now every referenced address gets a trap stub; misanalyzed calls fault loudly at runtime instead of failing silently at link time.
-2. **Generated CMakeLists uses /O1 + /MP.** /O2 on the >2 MB generated translation units LttP produces (funcs_118.c is 2.5 MB, funcs_072.c is 2.4 MB) makes MSVC's regalloc burn 20+ minutes per file. Switched generated default to /O1 with parallel cl.exe. The toolkit also now copies `runtime.c` and `display.c` into the output dir alongside the headers, so the generated project builds standalone with no manual cp.
+- The new ARM-BX-to-unmapped guard didn't catch anything, so the bad `pc=0x047A13BC` arrives via a non-BX path (`LDR pc, [...]`, `LDM ... ^` IRQ-return form, or `MSR` mishandled and clobbering pc). The interpreter has special cases for MSR/MRS but the data-processing handler runs *first* in the if-chain and may misclassify MSR (rd=15, S=0) as TEQ.
+- Even if we fix that path, the underlying issue is timing: the standalone runtime delivers VBlank/HBlank IRQs based on scanline ticks, but the game's startup writes to its IWRAM subhandler table at its own pace. Need to either (a) gate IRQ delivery on the game having written non-zero into the subhandler slot, or (b) install a "no-op handler if uninitialized" check inside the runtime.
+- Once IRQ dispatch works, `DISPCNT` should clear forced-blank during init and the title screen logo should appear.
 
 ## Numbers
 
