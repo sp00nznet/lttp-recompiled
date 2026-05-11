@@ -81,6 +81,9 @@ So: the runtime scheduler delivers a VBlank IRQ before the game has populated it
 [sp00nznet/gbarecomp@ab5cab7](https://github.com/sp00nznet/gbarecomp/commit/ab5cab7):
 5. **`cpu_bx` falls back to the interpreter for ROM targets not in the dispatch table.** With a per-call-site tracer wired through `func_0800B084` (the game's main), I bisected the hang to a state-machine dispatcher at `func_0800D788` that calls handlers via a function-pointer table starting at ROM `0x084273EC`. The state-0 handler at `0x0800D890` is a trivial `MOV r0,#0; BX lr` but **gbarecomp's static analyzer never discovered it as a function entry** (it's only reached via the table). `cpu_bx(0x0800D891)` therefore fell through to `r[15] = target` with no execution; the dispatcher saw r0 still holding the function-pointer value (nonzero) and spun forever. Now `cpu_bx` routes ROM-not-in-table targets through `run_iwram_function`, so any leaf handler missed by analysis is still executed via the interpreter. Effect on LttP: main loop reaches ~3700 iter/sec and forced blank clears (DISPCNT 0x80 → 0x40).
 
+[sp00nznet/gbarecomp@2c88f05](https://github.com/sp00nznet/gbarecomp/commit/2c88f05):
+6. **EEPROM_V (8KB) emulation.** LttP polls `0x0D000000` for an EEPROM "ready" bit after issuing read/write commands; without emulation the runtime returned ROM-mirror data forever. Implemented the bit-serial GBATEK protocol: detection by `"EEPROM_V"` SDK marker scan, 8KB storage, state machine over `bus_read16`/`bus_write16` in the `0x0D...` region (`"11"`+addr+stop for reads, `"10"`+addr+data+stop for writes, idle reads return ready=1). Persists to a `.eep` file alongside the ROM. Replaces the local short-circuit hack from the previous session — `func_08135E74` now returns through the real DMA-then-poll cycle.
+
 ## What's done
 
 | Component | How |
@@ -95,9 +98,9 @@ So: the runtime scheduler delivers a VBlank IRQ before the game has populated it
 
 ## Open questions / next dives
 
-- **EEPROM save detection.** LttP's save-detection routine at `func_08135E74` polls EEPROM at `0x0D000000`, waiting for a status bit that never comes (we have no EEPROM emulation). The wait loop is currently bypassed locally with a `return r0=0` hack — needs proper EEPROM device emulation in gbarecomp's runtime, or a temporary "fake-no-save" pretrap.
 - **BG/OBJ enable.** Main loop runs cleanly but DISPCNT stays at `0x0040` (display on, no layers). Game probably blocked on something save- or input-related before drawing the title screen. Tracing per-frame I/O writes to DISPCNT/BG control registers should show what's missing.
 - **Function-pointer table discovery.** The cpu_bx fallback works but it's a *runtime* fix. The deeper improvement is for the analyzer to discover state-machine handler tables and recompile their entries — would eliminate interpreter overhead for hot dispatch paths.
+- **Outer-state byte at EWRAM `0x0202A6D8`.** Stays at 0 indefinitely. The state-0 handler is a no-op `MOV r0,#0; BX lr`. Something else must advance the state — likely a separate event handler triggered by input or a timer that we're not delivering. Worth tracing writes to that address.
 
 ## Numbers
 
