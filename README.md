@@ -15,8 +15,9 @@ Driving the development of [gbarecomp](https://github.com/sp00nznet/gbarecomp) -
 | Native compile | **Done** - 20.8 MB AZLE.exe (MSVC /O1, MP, ~30 min) |
 | Runtime init | **Done** - SDL2 window, flat memory, BIOS HLE all online |
 | Boot frames | **Done** - 600+ frames render at 60 fps, IRQ handler runs cleanly |
-| Game past forced blank | Not yet - DISPCNT stays at 0x0080 (forced blank), same parity as Advance Wars |
-| Title screen | Not yet |
+| Game past forced blank | **Done** - DISPCNT moves from 0x0080 -> 0x0040 (forced blank cleared) |
+| Main loop running | **Done** - state-machine dispatcher at func_0800D788 cycles at ~3700 iter/sec |
+| Title screen | Not yet - BG/OBJ layers not enabled in DISPCNT yet (still 0x0040) |
 | Gameplay | Not yet |
 
 ```
@@ -77,6 +78,9 @@ So: the runtime scheduler delivers a VBlank IRQ before the game has populated it
 [sp00nznet/gbarecomp@76c26af](https://github.com/sp00nznet/gbarecomp/commit/76c26af):
 4. **ARM interpreter handles `MSR`/`MRS` before data-processing.** Hunting the IRQ spin further with LDR/LDM/DataProc-pc instrumentation surfaced the real root cause: `MSR CPSR_cf, r3` (`0xE129F003`) was being decoded as `TEQ` (opcode 9) by the data-processing handler because MSR's encoding overlaps with TST/TEQ/CMP/CMN-without-S. Then with Rd=15 the data-processing path dropped the XOR result into pc, producing the garbage `0x047A13BC` we'd been chasing. Moving the MSR/MRS checks above data-processing fixed it; LttP now runs 600+ frames cleanly through its IRQ handler.
 
+[sp00nznet/gbarecomp@ab5cab7](https://github.com/sp00nznet/gbarecomp/commit/ab5cab7):
+5. **`cpu_bx` falls back to the interpreter for ROM targets not in the dispatch table.** With a per-call-site tracer wired through `func_0800B084` (the game's main), I bisected the hang to a state-machine dispatcher at `func_0800D788` that calls handlers via a function-pointer table starting at ROM `0x084273EC`. The state-0 handler at `0x0800D890` is a trivial `MOV r0,#0; BX lr` but **gbarecomp's static analyzer never discovered it as a function entry** (it's only reached via the table). `cpu_bx(0x0800D891)` therefore fell through to `r[15] = target` with no execution; the dispatcher saw r0 still holding the function-pointer value (nonzero) and spun forever. Now `cpu_bx` routes ROM-not-in-table targets through `run_iwram_function`, so any leaf handler missed by analysis is still executed via the interpreter. Effect on LttP: main loop reaches ~3700 iter/sec and forced blank clears (DISPCNT 0x80 → 0x40).
+
 ## What's done
 
 | Component | How |
@@ -91,9 +95,9 @@ So: the runtime scheduler delivers a VBlank IRQ before the game has populated it
 
 ## Open questions / next dives
 
-- IRQ handler now runs cleanly, but the game stays in forced-blank (DISPCNT=0x0080) for 600+ frames. Same symptom Advance Wars hits per the gbarecomp README — likely missing mid-function entries during init (recompiled functions exist but a BX-into-the-middle dispatches to an empty stub) or a missing/incorrect BIOS HLE call.
-- Reproducer: run AZLE.exe and stderr is silent — no spins, no warnings — yet DISPCNT never changes. Need a tracer that logs *which* recompiled functions get called per frame so we can see which init function the game stops at.
-- Once that's pinned down, fix it in gbarecomp's analyzer (mid-function entry detection in Phase 7) or runtime (BIOS HLE coverage).
+- **EEPROM save detection.** LttP's save-detection routine at `func_08135E74` polls EEPROM at `0x0D000000`, waiting for a status bit that never comes (we have no EEPROM emulation). The wait loop is currently bypassed locally with a `return r0=0` hack — needs proper EEPROM device emulation in gbarecomp's runtime, or a temporary "fake-no-save" pretrap.
+- **BG/OBJ enable.** Main loop runs cleanly but DISPCNT stays at `0x0040` (display on, no layers). Game probably blocked on something save- or input-related before drawing the title screen. Tracing per-frame I/O writes to DISPCNT/BG control registers should show what's missing.
+- **Function-pointer table discovery.** The cpu_bx fallback works but it's a *runtime* fix. The deeper improvement is for the analyzer to discover state-machine handler tables and recompile their entries — would eliminate interpreter overhead for hot dispatch paths.
 
 ## Numbers
 
