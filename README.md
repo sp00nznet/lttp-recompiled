@@ -101,9 +101,15 @@ So: the runtime scheduler delivers a VBlank IRQ before the game has populated it
 
 ## Open questions / next dives
 
-- **Four Swords link-cable state machine — SIOCNT bit 3 (SD).** The block is now pinpointed exactly. `func_0800C54C` reads the 32-bit value at `0x04000128` (SIOCNT low half + SIOMLT_SEND high half) into r6. The game itself writes `0x00006003` to SIOCNT during init (baud=11, ID=00=parent). The state-0 path then checks `(r6 & 0x88) == 0x08`: bit 3 (SD = "connection chain unbroken") must be 1 and bit 7 (start/busy) must be 0. With our io_regs returning the game's own `0x6003` write, bit 3 = 0 → "disconnected" → function returns 0 → state byte at `0x03000BF0` stays at 0 → DISPCNT never advances past 0x40. Forcing SIOCNT bit 3 = 1 in our init gets overwritten by the game's own SIOCNT writes; the fix is to make SIOCNT *reads* synthesize bit 3 = 1 (or 0 depending on game expectations) instead of returning the last write. For LttP+Four Swords this means either (a) a proper SIO multiplayer master/slave simulation, or (b) a "single-player auto-detect" path that flips state via a timeout - which I haven't found yet.
-- **BG/OBJ enable.** DISPCNT stays at `0x0040` because the gate above hasn't moved. Unblocking SIOCNT bit 3 = 1 should let the state machine progress, after which the game should set up BG control registers and we'd see real rendering.
-- **Function-pointer table discovery.** The cpu_bx fallback works but it's a *runtime* fix. The deeper improvement is for the analyzer to discover state-machine handler tables and recompile their entries — would eliminate interpreter overhead for hot dispatch paths.
+The Four Swords link-cable state machine has at least 3 gates. With a SIOCNT-read override that forces bit 3 = 1 (a local hack, not pushed upstream), I drove the machine through the first one:
+
+- **Gate 1 (cleared with SIOCNT.SD = 1 hack):** `func_0800C54C` state-0 path checks `(SIOCNT & 0x88) == 0x08`. Game writes `0x6003`; reading it back returns `0x6003` with bit 3 = 0. Override fixes this: state+1 advances 0→1, return value becomes 0x80.
+- **Gate 2 (current block):** state-1 path checks `struct+2 != 0` before incrementing the counter at `struct+8`. struct+2 = `0x02030792` stays at 0; nothing in our run writes it. Probably set by an SIO recv interrupt handler that runs only when a remote unit actually transmits data.
+- **Gate 3 (anticipated):** once struct+8 increments past 7, state advances to 2. That path is in `func_0800C5FC` → calls `func_0800C6A8`. Haven't disassembled it yet.
+
+The real fix here is full SIO multiplayer handshake simulation: respond to SIOCNT writes that initiate transfers with synthesized "no remote unit detected → fall back to single-player" or "fake one connected slave" responses. That's days of work. For LttP specifically there's probably also a single-player code path triggered by a timer counter, but I haven't found it yet.
+
+- **Function-pointer table discovery (broader gbarecomp improvement).** The cpu_bx fallback works but it's a *runtime* fix. The deeper improvement is for the analyzer to discover state-machine handler tables and recompile their entries — would eliminate interpreter overhead for hot dispatch paths.
 
 ## Numbers
 
