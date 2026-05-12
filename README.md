@@ -111,20 +111,72 @@ LttP+Four Swords has at least three independent gates between "main loop running
 - **Gate 2 — struct+2 OR struct+3 (the real wall).** State-1 path checks `struct+2 != 0`; struct+2 is set only by `func_0800C6A8`'s tail: `struct+2 |= struct+3`. struct+3 has a bit set per "detected player slot" (4 slots) only when a 12-halfword sum from a per-slot table at `[struct+0x2C + slot*0x1C]` equals `-15` (signed). That's a checksum over received link-cable data: real-hardware SIO transfers fill the table with peer GBA data; with no peers and no SIO transfer simulation, the table is zero, sum is 0, never matches -15, struct+3 never gets a bit set, struct+2 stays 0, machine stays at state 1.
 - **No timeout fallback found.** Counter at struct+B increments every call but wraps at 255 — no length-gated branch to a single-player path. Either the timeout is elsewhere, or the original cart genuinely refuses to boot LttP without seeing a coherent SIO bus.
 
-### Deep RE findings
+### Full RE map of the Four Swords link-cable boot
 
-Hex-searched the ROM for `0x04000120` (SIOMULTI0) — only two pool references. The SIO IRQ handler is at ROM `0x0800C7E8`. It expects `SIOMULTI[0] == 0xFEFE` as a sync sentinel; on match it advances `struct+0x14`/`+0x18` counters; on mismatch it writes the next halfword of a per-frame response buffer (at `struct+0x20`) to `SIOMLT_SEND` so the next loopback delivers more peer data. The slot-copy loop at `0x0800C870` writes `SIOMULTI[N]` into slot N's table at offset `struct+0x18*2`, slot stride `0x1C`.
+After deep tracing, the protocol is mapped end-to-end. It's a multi-stage state machine driven by an SIO IRQ that the cart never triggers on its own without an external sync.
 
-The game COPIES the SIO IRQ handler from ROM `0x0800C7E8` to **EWRAM `0x02030590`** during init, and installs the IWRAM subhandler table entry at `0x03000B70` to point there. Verified directly: at runtime, subhandler[0] = `0x02030591` (Thumb EWRAM pointer) with the matching `PUSH/SUB sp/LDR r0/...` byte pattern. So the handler runs through gbarecomp's interpreter (EWRAM target → `run_iwram_function`), not recompiled C — which is fine because all the bus reads/writes still go through the proper hooks.
+**The struct at EWRAM `0x02030790`** is the SIO multiplayer control block. Key fields:
 
-**The actual wall.** Implemented a periodic fake SIO IRQ that delivers `SIOMULTI[0]=0xFEFE` plus 0xFFFF for idle slots, force-enables `IE.bit7` and sets the BIOS IF mirror at `0x03007FF8`. Verified IRQ delivery fires (`[irq] SIO pending=0x0085 ime=1`) and the EWRAM handler executes. But struct+2 still stays 0. Cause: the slot-tables-base pointer at `struct+0x2C` is zero (`bus_read32(0x020307BC) = 0`), so the slot-copy loop writes to addresses `0x00000000 + slot*0x1C + ...` — BIOS region, writes are no-ops. The pointer would normally be set by code that only runs *after* the Four Swords handshake has already advanced past the gate, creating a circular dependency: the data structures the SIO handler needs to fill don't exist until the gate opens, and the gate doesn't open until the structures are filled.
+| Offset | Purpose |
+|---|---|
+| +1 | Inner state byte (state machine in `func_0800C54C`) |
+| +2 | Checksum result accumulator (`\|= struct+3` in `func_0800C6A8` tail) |
+| +3 | Per-slot "detected" bits (set when a slot's 12-halfword sum == -15) |
+| +5 | Sequence flag (set when `struct+0x18 == 0xB` during an SIO IRQ) |
+| +0x14 | Error-path counter |
+| +0x18 | Slot-write offset (initialized to 0xD, decremented to -1 on sync, then walks 0..0xB) |
+| +0x1C | Pointer to per-slot tables region 0 |
+| +0x20 | Pointer to per-slot tables region 1 |
+| +0x24 | "Current write" buffer pointer (swaps with +0x28 on sync) |
+| +0x28 | "Last written" buffer pointer |
+| +0x2C | "Read for checksum" buffer pointer (swap of +0x28 after rotate fn) |
 
-The fix is one of:
-1. **Full SIO peer simulation** — synthesize an entire LttP+Four Swords protocol partner that handshakes with the cart (master/child role exchange, sync packets, data exchange) coherently enough that the cart sets up its own slot tables.
-2. **Identify and force-run the slot-table-init function directly** — locate the code that writes `struct+0x2C` to a valid EWRAM/IWRAM buffer and call it manually before the gate is hit.
-3. **Inject the expected post-handshake state** — write the right values into struct+0x2C-pointed slot tables, struct+3, struct+5, etc. so gate 2 already shows "ready" on first check.
+Verified at runtime: `struct+0x24` = 0x020307F8, `struct+0x2C` alternates between 0x020308D8 and 0x02030868 (double-buffered).
 
-Option 3 is the path of least RE effort but most knowledge-of-game-internals. None fit in one session.
+**Init path:** the SIO struct is initialized by code at ROM `0x0800C476-0x0800C494` (called once during boot). It writes `struct+0x14 = struct+0x18 = 0xD` and sets the five pointer fields to layouts within the same struct (slot region at `struct+0x148`).
+
+**SIO IRQ handler at ROM `0x0800C7E8`** gets COPIED to EWRAM `0x02030590` during init (verified: subhandler[0] in IWRAM `0x03000B70` points to `0x02030591`, and a byte dump of EWRAM matches the ROM source). The handler runs through gbarecomp's interpreter on EWRAM targets.
+
+Protocol decode:
+- **Sync packet**: `SIOMULTI[0] == 0xFEFE`. Resets `struct+0x18` to -1, swaps `+0x24/+0x28` buffers, sets BIOS IF mirror bit 7. Then slot-copies the 4 SIOMULTI values into the new write buffer at slot-offset `struct+0x18 * 2 = -2`.
+- **Data packet**: `SIOMULTI[0] != 0xFEFE`. Writes next halfword of a per-frame response buffer at `struct+0x20[counter*2]` into `SIOMLT_SEND` (so master's next transfer carries response). Increments `struct+0x14`. Then slot-copies SIOMULTI into the current write buffer at slot-offset `struct+0x18 * 2`.
+- After 12 data packets, `struct+0x18` reaches 0xB → sets `struct+5 = 1`.
+
+**The checksum gate at `func_0800C6A8`:**
+1. Calls a function pointer at `[0x02030950]` (which is itself a copy of ROM `0x08000318`, an ARM "rotate buffers" function that swaps `+0x28 ↔ +0x2C` and returns the OLD value of `struct+5`).
+2. If returned value is 0 → skip everything, exit. So `struct+5` must have been set to 1 by the SIO handler before `C6A8` runs.
+3. Otherwise: for each of 4 slots, sum the 12 halfwords. If sum == -15 (signed 16-bit), set bit N in `struct+3`.
+4. Tail: `struct+2 |= struct+3`.
+
+**The gate at `func_0800C54C` state-1:** checks `struct+2 != 0`. If yes, increments `struct+8`; when `struct+8 > 7`, state advances to 2.
+
+**The critical chain (all must be true for state to advance):**
+1. Sync packet must arrive (resets state, swaps buffers)
+2. 12 data packets must follow (fills the write buffer)
+3. Final data packet must bring `struct+0x18` to 0xB → sets `struct+5 = 1`
+4. After the buffer swap from next sync, `func_0800C6A8` runs the checksum
+5. At least one slot's 12 halfwords sum to -15 → `struct+3` gets a bit set
+6. `struct+2 |= struct+3` → gate 2 opens
+
+**Why "force struct+2 = 1" doesn't work:** the state machine has dozens of other field dependencies after gate 2 — `func_0800B524` (VBlank wait), `func_0800D788` (sub-dispatcher), and downstream functions all read additional state set up by the proper protocol path. Bypassing gate 2 alone produces incorrect downstream state.
+
+### What "full SIO peer simulation" means concretely
+
+To execute the chain above, the runtime needs to play the role of a remote GBA in the multiplayer chain:
+
+1. **Detect when the cart enters MultiPlayer mode** (SIOCNT bits 12-13 == 10, IRQE bit 14 = 1).
+2. **Periodically inject a transfer-complete event** even though the cart isn't writing `SIOCNT.start = 1` (verified: the cart doesn't initiate; it expects to *receive* sync from a parent).
+3. **Drive a 1-sync + 12-data packet cycle:**
+   - On sync injection: `SIOMULTI[0] = 0xFEFE`, others = 0xFFFF.
+   - On data injections: `SIOMULTI[0] = arbitrary != 0xFEFE`, `SIOMULTI[1..3]` crafted so that across 12 packets the per-slot 12-halfword sum equals -15 for slot 1 (e.g. 11× 0xFFFF + 1× 0xFFFC).
+4. **Fire SIO IRQ after each injection** with IF bit 7, BIOS IF mirror bit 7, and IE bit 7 forced.
+5. **Handle the back-channel:** after each non-sync data packet the cart's handler writes a response halfword to `SIOMLT_SEND`. A real peer would consume this; we ignore it (the cart is just talking to itself).
+
+That's a couple of hundred lines of state-machine code in `runtime.c`, plus enough RE on the cart's *downstream* code paths (after gate 2 opens) to confirm the rest of init proceeds. Realistic estimate: 1-2 days of focused work to a verified title screen.
+
+### Why we stopped here
+
+Everything above is now documented at the level of "here are the exact addresses and conditions; pick up and implement." We didn't write the full simulation in this session because: each iteration is a full AZLE.exe rebuild (~minutes), the state machine has many fields that all need to be in sync, and the cart's downstream code paths (post-gate-2) still need RE before we know what other state needs to be coherent. The right next session is one focused on this single task: build the simulation, test boot-to-title-screen, iterate.
 
 - **Function-pointer table discovery (broader gbarecomp improvement).** The cpu_bx fallback works but it's a *runtime* fix. The deeper improvement is for the analyzer to discover state-machine handler tables and recompile their entries — would eliminate interpreter overhead for hot dispatch paths.
 
