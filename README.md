@@ -174,9 +174,29 @@ To execute the chain above, the runtime needs to play the role of a remote GBA i
 
 That's a couple of hundred lines of state-machine code in `runtime.c`, plus enough RE on the cart's *downstream* code paths (after gate 2 opens) to confirm the rest of init proceeds. Realistic estimate: 1-2 days of focused work to a verified title screen.
 
-### Why we stopped here
+### SIO peer simulator built in `runtime.c` (latest session)
 
-Everything above is now documented at the level of "here are the exact addresses and conditions; pick up and implement." We didn't write the full simulation in this session because: each iteration is a full AZLE.exe rebuild (~minutes), the state machine has many fields that all need to be in sync, and the cart's downstream code paths (post-gate-2) still need RE before we know what other state needs to be coherent. The right next session is one focused on this single task: build the simulation, test boot-to-title-screen, iterate.
+The full simulation has been written and verified working end-to-end except for the very final step. Implemented as a per-IRQ data injection inside `check_interrupts`:
+
+- 13-packet cycle (1 sync + 12 data) state machine
+- Sync packet: `SIOMULTI[0] = 0xFEFE`, others = `0xFFFF`
+- Data packets: `SIOMULTI[0] = 0x0000`, `SIOMULTI[1]` = `0xFFFF` for first 11 + `0xFFFC` for packet 12 → slot 1 sum = `-15`
+- One IF bit 7 set per frame; hard-cleared after each delivery (works around an apparent ARM interpreter bug where the trampoline's `STRH r0, [r3, #2]` at ROM `0x080001B0` doesn't actually trigger `bus_write16`'s write-1-to-clear path)
+
+**Verified at runtime:**
+- SIO IRQ delivery fires per-frame as expected
+- Trampoline correctly dispatches to EWRAM SIO handler (byte-for-byte match with ROM source)
+- `struct+0x18` cycles correctly: `-1 → 0 → 1 → ... → 0xB → 0xC → -1` per 13-packet cycle
+- `struct+5 = 1` is set at exactly the right moment (data packet 12 when struct+0x18 = 0xB)
+- `struct+0x24` (write buffer ptr) swaps on every sync packet, exactly per protocol
+- Slot 1 region in the write buffer gets filled with `[0xFFFF * 11, 0xFFFC]` — sum = -15 ✓
+
+**Remaining blocker — buffer rotation alignment:**
+The checksum at `func_0800C6A8` reads from `struct+0x2C` (the read buffer). Even with the gate patched open, all four slot sums read as `0`. The rotate function in EWRAM swaps `struct+0x28`/`struct+0x2C` on every C6A8 call; with main loop running ~3700 iter/sec and SIO IRQ at 60Hz, the parity of swaps between when slot data is written and when checksum reads is wrong. Two issues to chase:
+1. **Buffer rotation alignment**: trace which buffer `struct+0x2C` points at when struct+5 is set, vs which buffer holds the just-filled slot data. If different, find the protocol-correct moment for checksum to read.
+2. **ARM interpreter STRH→IF bug** (upstream gbarecomp): the trampoline's `STRH r0, [r3, #2]` to ack IF doesn't fire `bus_write16`'s write-1-to-clear. Worked around with manual IF clear after delivery in check_interrupts, but the underlying interpreter mishandling is a generic bug worth fixing.
+
+The right next session can pick up at "find which one of these is the alignment fix" — should be a quick experiment with one of: (a) only swap buffers when struct+5 was 1 (mimic real game cycle timing), (b) call C6A8 only N times per frame instead of every iter, (c) re-read the rotate function's exact semantics.
 
 - **Function-pointer table discovery (broader gbarecomp improvement).** The cpu_bx fallback works but it's a *runtime* fix. The deeper improvement is for the analyzer to discover state-machine handler tables and recompile their entries — would eliminate interpreter overhead for hot dispatch paths.
 
