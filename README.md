@@ -87,6 +87,9 @@ So: the runtime scheduler delivers a VBlank IRQ before the game has populated it
 [sp00nznet/gbarecomp@cdace91](https://github.com/sp00nznet/gbarecomp/commit/cdace91):
 7. **SIOMULTI[0..3] default = 0xFFFF (no link cable).** Found while tracing why LttP's outer state byte at IWRAM `0x03000BF0` never advances past 0. `func_0800C54C` reads a 32-bit value from `0x04000128` (SIOCNT+SIOMLT_SEND) plus an EWRAM control byte; with `io_regs` zero-init, it sees "link cable possibly connected, no idle pattern". Real hardware drives unconnected SIO pins high via pull-ups, so SIOMULTI reads as 0xFFFF. Set that as the runtime default. Didn't actually unblock LttP (the Four Swords state machine has more gates beyond SIO data), but matches hardware and is generically correct for every other GBA title.
 
+[sp00nznet/gbarecomp@26522a1](https://github.com/sp00nznet/gbarecomp/commit/26522a1):
+8. **Minimal SIO multiplayer transfer simulation.** On SIOCNT write with start bit (bit 7) high, immediately simulate transfer completion: SIOMULTI[0] = whatever the parent had in SIOMLT_SEND, SIOMULTI[1..3] = 0xFFFF (idle), clear start bit, set error bit (no slaves), raise SIO IRQ if enabled. Games that gate boot on "did a transfer complete and was there a slave" can now fall through to single-player cleanly. Doesn't unblock LttP+Four Swords specifically (it never writes `start=1` — it waits for the SD line to read high *before* it'll even initiate, which requires full link-cable hardware emulation, not just transfer simulation), but lands as a generic capability.
+
 ## What's done
 
 | Component | How |
