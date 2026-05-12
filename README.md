@@ -84,6 +84,9 @@ So: the runtime scheduler delivers a VBlank IRQ before the game has populated it
 [sp00nznet/gbarecomp@2c88f05](https://github.com/sp00nznet/gbarecomp/commit/2c88f05):
 6. **EEPROM_V (8KB) emulation.** LttP polls `0x0D000000` for an EEPROM "ready" bit after issuing read/write commands; without emulation the runtime returned ROM-mirror data forever. Implemented the bit-serial GBATEK protocol: detection by `"EEPROM_V"` SDK marker scan, 8KB storage, state machine over `bus_read16`/`bus_write16` in the `0x0D...` region (`"11"`+addr+stop for reads, `"10"`+addr+data+stop for writes, idle reads return ready=1). Persists to a `.eep` file alongside the ROM. Replaces the local short-circuit hack from the previous session — `func_08135E74` now returns through the real DMA-then-poll cycle.
 
+[sp00nznet/gbarecomp@cdace91](https://github.com/sp00nznet/gbarecomp/commit/cdace91):
+7. **SIOMULTI[0..3] default = 0xFFFF (no link cable).** Found while tracing why LttP's outer state byte at IWRAM `0x03000BF0` never advances past 0. `func_0800C54C` reads a 32-bit value from `0x04000128` (SIOCNT+SIOMLT_SEND) plus an EWRAM control byte; with `io_regs` zero-init, it sees "link cable possibly connected, no idle pattern". Real hardware drives unconnected SIO pins high via pull-ups, so SIOMULTI reads as 0xFFFF. Set that as the runtime default. Didn't actually unblock LttP (the Four Swords state machine has more gates beyond SIO data), but matches hardware and is generically correct for every other GBA title.
+
 ## What's done
 
 | Component | How |
@@ -98,9 +101,9 @@ So: the runtime scheduler delivers a VBlank IRQ before the game has populated it
 
 ## Open questions / next dives
 
-- **BG/OBJ enable.** Main loop runs cleanly but DISPCNT stays at `0x0040` (display on, no layers). Game probably blocked on something save- or input-related before drawing the title screen. Tracing per-frame I/O writes to DISPCNT/BG control registers should show what's missing.
+- **Four Swords link-cable state machine.** The outer state byte at IWRAM `0x03000BF0` is supposed to be advanced by `func_0800C54C`, which reads SIOCNT + EWRAM control bytes. With SIOMULTI now defaulting to 0xFFFF (correct for "no cable"), the function still returns 0 each time - it then gates on an EWRAM byte at `0x020307A8` being `0xD` (likely "Four Swords sub-protocol initialized"), which never gets set. Either we need a fuller SIO simulation (cable disconnect handshake), or to identify the path that drives the game into single-player LttP mode when no cable is present.
+- **BG/OBJ enable.** Main loop runs cleanly but DISPCNT stays at `0x0040` (display on, no layers). The state-machine gate above is the proximate cause - once that advances, the game should start writing BG control registers.
 - **Function-pointer table discovery.** The cpu_bx fallback works but it's a *runtime* fix. The deeper improvement is for the analyzer to discover state-machine handler tables and recompile their entries — would eliminate interpreter overhead for hot dispatch paths.
-- **Outer-state byte at EWRAM `0x0202A6D8`.** Stays at 0 indefinitely. The state-0 handler is a no-op `MOV r0,#0; BX lr`. Something else must advance the state — likely a separate event handler triggered by input or a timer that we're not delivering. Worth tracing writes to that address.
 
 ## Numbers
 
